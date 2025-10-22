@@ -14,11 +14,26 @@ After dimensionality reduction, the PC algorithm is applied to discover causal r
 
 ## Features
 
+### Core Capabilities
 - **Flexible Data Sources**: Works with both real market data (via yfinance) and synthetic data
 - **Multiple Dimensionality Reduction Strategies**: Choose the approach that best fits your analysis needs
-- **Causal Discovery**: Implements the PC algorithm with Fisher's Z test for conditional independence
-- **Synthetic Data Generation**: Includes a synthetic market data generator with known causal structure for testing
-- **Comprehensive Output**: Displays discovered causal relationships in an easy-to-read format
+- **Synthetic Data Generation**: Includes a synthetic market data generator with known causal structure for testing and validation
+
+### Advanced Causal Discovery
+- **Multiple Independence Tests**:
+  - **Fisher-Z Test**: Fast, parametric test assuming Gaussian data (default)
+  - **Kernel CI (KCI) Test**: Non-parametric test for non-Gaussian financial data
+- **Time-Series Causality**:
+  - Lagged feature creation to capture temporal causal relationships
+  - Critical for financial data where causality is often delayed
+- **Ground Truth Validation**:
+  - Automatic validation against known causal structure (synthetic data)
+  - Precision, Recall, F1-Score, and Structural Hamming Distance (SHD) metrics
+  - Detailed comparison showing correct, missed, and spurious edges
+
+### Output
+- **Comprehensive Results**: Displays discovered causal relationships in an easy-to-read format
+- **Validation Metrics**: Quantifies algorithm performance against ground truth
 
 ## Installation
 
@@ -75,7 +90,7 @@ Note: Real market data download may fail due to rate limiting or API restriction
 python causal.py [OPTIONS]
 ```
 
-Options:
+#### Basic Options
 - `--synthetic`: Use synthetic data instead of real market data
 - `--strategy {1,2,3}`: Choose dimensionality reduction strategy (default: 1)
   - 1: Proxy/Aggregation approach
@@ -83,17 +98,57 @@ Options:
   - 3: Clustering/Representative approach
 - `--no-causal`: Skip causal discovery analysis (only perform data reduction)
 
+#### Advanced Options
+- `--use-lags`: Create lagged features for time-series causal discovery
+- `--max-lag N`: Maximum number of lags to include (default: 1)
+- `--test-type {fisherz,kci}`: Conditional independence test
+  - `fisherz`: Fisher-Z test (fast, assumes Gaussian data) - default
+  - `kci`: Kernel CI test (slow, handles non-Gaussian data)
+- `--no-validate`: Skip validation against ground truth (synthetic data only)
+
 ### Examples
 
+#### Basic Usage
+
 ```bash
-# Run with synthetic data using Strategy 1 (Proxy)
-python causal.py --synthetic --strategy 1
+# Basic usage with synthetic data and validation
+python causal.py --synthetic
 
 # Run with real data using Strategy 2 (PCA)
 python causal.py --strategy 2
 
 # Run with synthetic data but skip causal discovery
 python causal.py --synthetic --no-causal
+```
+
+#### Advanced Time-Series Analysis
+
+```bash
+# Use lagged features to capture temporal causality
+python causal.py --synthetic --use-lags --max-lag 1
+
+# Use longer lags (2-day lagged relationships)
+python causal.py --synthetic --use-lags --max-lag 2
+```
+
+#### Non-Gaussian Data Handling
+
+```bash
+# Use KCI test for non-Gaussian financial data (slower but more robust)
+python causal.py --synthetic --test-type kci
+
+# Combine KCI with lagged features
+python causal.py --synthetic --use-lags --test-type kci
+```
+
+#### Validation and Testing
+
+```bash
+# Run without validation (faster)
+python causal.py --synthetic --no-validate
+
+# Full analysis: lags + KCI + validation
+python causal.py --synthetic --use-lags --max-lag 1 --test-type kci
 ```
 
 ## Output
@@ -181,15 +236,56 @@ This approach maintains interpretability while reducing dimensionality.
 
 The tool uses the **PC (Peter-Clark) algorithm**, a constraint-based method for causal discovery:
 
-- **Conditional Independence Test**: Fisher's Z test
+- **Conditional Independence Tests**:
+  - **Fisher-Z Test** (default): Fast, parametric test assuming Gaussian data
+  - **Kernel CI (KCI) Test**: Non-parametric test for non-Gaussian financial data
+    - Recommended for financial time series (leptokurtic, fat-tailed distributions)
+    - Significantly slower but more robust
 - **Significance Level**: α = 0.05 (default)
 - **Output**: Directed acyclic graph (DAG) showing causal relationships
+
+### Time-Series Causality
+
+Financial causality is often **lagged** (e.g., VIX spike at t-1 causes SPY drop at t). The tool addresses this with:
+
+- **Lagged Features**: Automatically creates features for variables at t-k where k = 1, 2, ...
+- **Example**: With `--use-lags --max-lag 2`, each variable V becomes:
+  - V (current value)
+  - V_L1 (1-day lag)
+  - V_L2 (2-day lag)
+- This allows the PC algorithm to discover temporal causal relationships
 
 ### Interpreting Results
 
 - **Causal Parents**: Variables that directly influence another variable
 - **Root Nodes**: Variables with no causal parents (exogenous variables)
 - **Direction**: A → B means "A causes B" or "A is a causal parent of B"
+- **Lagged Relationships**: A_L1 → B means "A at time t-1 causes B at time t"
+
+### Validation Metrics
+
+When using synthetic data, the tool automatically validates discovered relationships:
+
+- **Precision**: Proportion of discovered edges that are correct
+  - `Precision = True Positives / (True Positives + False Positives)`
+- **Recall**: Proportion of true edges that were discovered
+  - `Recall = True Positives / (True Positives + False Negatives)`
+- **F1 Score**: Harmonic mean of precision and recall
+  - `F1 = 2 × (Precision × Recall) / (Precision + Recall)`
+- **Structural Hamming Distance (SHD)**: Total number of edge errors
+  - `SHD = False Positives + False Negatives`
+
+Example validation output:
+```
+============================================================
+VALIDATION METRICS
+============================================================
+Precision: 0.750 (3/4 edges correct)
+Recall:    0.600 (3/5 edges found)
+F1 Score:  0.667
+SHD:       3 (edge errors: 1 spurious + 2 missed)
+============================================================
+```
 
 ## Synthetic Data Generation
 
@@ -220,15 +316,36 @@ This allows for validation and testing of the causal discovery algorithm.
 - **Strategy 2**: O(n²) - PCA computation
 - **Strategy 3**: O(nk) - K-means clustering
 - **PC Algorithm**: O(p²n) where p = number of variables, n = sample size
+- **Fisher-Z Test**: O(n) per test
+- **KCI Test**: O(n²) per test - significantly slower
 
-### Limitations
+#### Performance Considerations
 
-1. **Sample Size**: Causal discovery requires sufficient data (typically n > 500)
-2. **Assumptions**: PC algorithm assumes:
-   - Causal sufficiency (no hidden confounders)
-   - Causal Markov condition
-   - Faithfulness condition
-3. **Real Data**: Yahoo Finance API may rate-limit or block requests
+- **Without Lags + Fisher-Z**: Fast, handles 15+ variables easily
+- **With Lags + Fisher-Z**: Moderate, recommended max 10-12 variables
+- **Without Lags + KCI**: Slow, recommended max 8-10 variables
+- **With Lags + KCI**: Very slow, recommended max 6-8 variables
+
+### Key Assumptions and Limitations
+
+#### For Financial Data
+1. **Non-Gaussianity**: Financial returns are fat-tailed and skewed
+   - **Solution**: Use `--test-type kci` for more robust results
+2. **Temporal Causality**: Markets exhibit lagged causal relationships
+   - **Solution**: Use `--use-lags` to capture time-series dependencies
+3. **Sample Size**: Causal discovery requires sufficient data (typically n > 500)
+   - More variables require more data for reliable discovery
+
+#### PC Algorithm Assumptions
+1. **Causal Sufficiency**: No hidden confounders
+   - In markets, this is often violated (unobserved macroeconomic factors)
+2. **Causal Markov Condition**: Variables are independent of non-descendants given parents
+3. **Faithfulness**: All conditional independencies in data reflect graph structure
+
+#### Practical Limitations
+1. **Real Data**: Yahoo Finance API may rate-limit or block requests
+2. **Computational Cost**: KCI test can be very slow for large datasets
+3. **Validation**: Only available for synthetic data with known ground truth
 
 ## Project Structure
 
@@ -267,6 +384,59 @@ If you use this code in your research, please cite:
 
 This project is licensed under the MIT License - see the LICENSE file for details.
 
+## Best Practices and Recommendations
+
+### For Financial Time-Series Data
+
+Based on the characteristics of financial data, here are recommended configurations:
+
+#### 1. **Start with Validation on Synthetic Data**
+```bash
+python causal.py --synthetic
+```
+This allows you to understand algorithm performance before applying to real data.
+
+#### 2. **Use Lagged Features for Real Causality**
+```bash
+python causal.py --synthetic --use-lags --max-lag 1
+```
+Financial causality is almost always lagged. VIX spike at t-1 causes SPY drop at t, not simultaneously.
+
+#### 3. **Use KCI Test for Non-Gaussian Data**
+```bash
+python causal.py --synthetic --test-type kci
+```
+Financial returns are leptokurtic (fat-tailed). KCI is more robust than Fisher-Z but slower.
+
+#### 4. **Recommended Full Pipeline**
+```bash
+# For exploratory analysis (fast)
+python causal.py --synthetic --use-lags --max-lag 1
+
+# For robust results (slow but accurate)
+python causal.py --synthetic --use-lags --max-lag 1 --test-type kci
+```
+
+### Interpreting Results
+
+1. **Compare Against Ground Truth**: When using synthetic data, always check validation metrics
+   - Precision < 0.5: Many spurious edges, consider increasing alpha or using KCI
+   - Recall < 0.5: Missing true edges, consider decreasing alpha or adding lags
+
+2. **Look for Economic Sense**: Discovered relationships should have economic interpretation
+   - VIX → Equities (volatility causes price changes) ✓
+   - Random Stock A → VIX (unlikely) ✗
+
+3. **Validate with Multiple Methods**:
+   - Try both Fisher-Z and KCI
+   - Try different lag values (1, 2, 3 days)
+   - Compare across strategies (Proxy vs PCA vs Clustering)
+
+4. **Be Skeptical of Spurious Edges**: Observational data often contains:
+   - Common causes (hidden confounders)
+   - Feedback loops
+   - Selection bias
+
 ## Troubleshooting
 
 ### Issue: yfinance fails to download data
@@ -289,12 +459,58 @@ python causal.py --strategy 1
 - Insufficient data (increase sample size)
 - Alpha too low (data cannot reject independence)
 - Variables are truly independent
+- Causality is lagged (try `--use-lags`)
+
+**Solutions**:
+```bash
+# Try with lagged features
+python causal.py --synthetic --use-lags --max-lag 1
+
+# Try with higher alpha (more permissive)
+# (requires code modification to pass alpha parameter)
+
+# Try KCI test instead of Fisher-Z
+python causal.py --synthetic --test-type kci
+```
+
+### Issue: KCI test is too slow
+
+**Solution**: Reduce the number of variables:
+```bash
+# The code automatically limits variables based on test type
+# But you can use Strategy 1 (Proxy) which has fewer variables
+python causal.py --synthetic --strategy 1 --test-type kci
+```
+
+### Issue: Validation metrics are poor (low precision/recall)
+
+**Possible causes**:
+- Using Fisher-Z on non-Gaussian data (use KCI)
+- Missing temporal relationships (use lags)
+- Alpha is too high or too low
+
+**Solutions**:
+```bash
+# Use robust KCI test
+python causal.py --synthetic --test-type kci
+
+# Add lagged features
+python causal.py --synthetic --use-lags --max-lag 1
+
+# Combine both
+python causal.py --synthetic --use-lags --test-type kci
+```
 
 ### Issue: Import errors
 
 **Solution**: Ensure all dependencies are installed:
 ```bash
 pip install -r requirements.txt
+```
+
+If `kci` import fails:
+```bash
+pip install --upgrade causal-learn
 ```
 
 ## Contact

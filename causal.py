@@ -5,9 +5,11 @@ from sklearn.decomposition import PCA
 from sklearn.cluster import KMeans
 from scipy.spatial.distance import cdist
 from causallearn.search.ConstraintBased.PC import pc
-from causallearn.utils.cit import fisherz
+from causallearn.utils.cit import fisherz, kci
+from causallearn.utils.GraphUtils import GraphUtils
 import warnings
 import argparse
+from typing import Dict, List, Tuple
 
 # Suppress warnings from yfinance and sklearn
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -50,6 +52,25 @@ OTHER_PROXIES = [
 ]
 
 PROXY_TICKERS = GICS_SECTORS + OTHER_PROXIES
+
+# Ground truth causal graph for synthetic data (contemporaneous relationships)
+# Format: {child: [list of parents]}
+KNOWN_CAUSAL_GRAPH = {
+    'SPY': ['^VIX'],  # VIX influences SPY
+    'XLK': ['SPY', '^VIX'],  # SPY and VIX influence Technology
+    'XLF': ['SPY', '^TNX'],  # SPY and TNX influence Financials
+    'XLV': ['SPY'],  # SPY influences Healthcare
+    'XLC': ['XLK', 'SPY'],  # Technology and SPY influence Communication
+    'XLY': ['SPY', '^VIX'],  # SPY and VIX influence Consumer Discretionary
+    'XLP': ['SPY'],  # SPY influences Consumer Staples
+    'XLE': ['SPY'],  # SPY influences Energy
+    'XLU': ['SPY'],  # SPY influences Utilities
+    'XLI': ['SPY', '^VIX'],  # SPY and VIX influence Industrials
+    'XLB': ['SPY'],  # SPY influences Materials
+    'XLRE': ['SPY', '^TNX'],  # SPY and TNX (negatively) influence Real Estate
+    '^VIX': [],  # VIX is exogenous (root node)
+    '^TNX': [],  # TNX is exogenous (root node)
+}
 
 
 # --- 2. Data Fetching Functions ---
@@ -202,6 +223,134 @@ def create_feature_matrix(data_df):
 
     return features_df
 
+def create_lagged_features(data_matrix: pd.DataFrame, max_lag: int = 1) -> pd.DataFrame:
+    """
+    Creates lagged features for time-series causal discovery.
+
+    This addresses the temporal nature of financial causality where
+    variables at time t-k influence variables at time t.
+
+    Args:
+        data_matrix: DataFrame with features (timesteps × variables)
+        max_lag: Maximum number of lags to include (default: 1)
+
+    Returns:
+        DataFrame with original and lagged features
+    """
+    print(f"\nCreating lagged features (max_lag={max_lag})...")
+
+    lags = [data_matrix]
+
+    for lag in range(1, max_lag + 1):
+        lagged = data_matrix.shift(lag).add_suffix(f'_L{lag}')
+        lags.append(lagged)
+
+    lagged_matrix = pd.concat(lags, axis=1)
+
+    # Drop NaNs introduced by shifting
+    lagged_matrix = lagged_matrix.iloc[max_lag:]
+
+    print(f"Lagged matrix shape: {lagged_matrix.shape}")
+    print(f"Original variables: {data_matrix.shape[1]}")
+    print(f"With lags: {lagged_matrix.shape[1]} variables")
+
+    return lagged_matrix
+
+def validate_causal_graph(discovered_graph: Dict[str, List[str]],
+                         true_graph: Dict[str, List[str]]) -> Dict[str, float]:
+    """
+    Validates discovered causal graph against ground truth.
+
+    Computes precision, recall, F1 score, and Structural Hamming Distance (SHD).
+
+    Args:
+        discovered_graph: Dictionary mapping variables to their discovered parents
+        true_graph: Dictionary mapping variables to their true parents
+
+    Returns:
+        Dictionary with validation metrics
+    """
+    print(f"\n{'='*60}")
+    print("VALIDATION AGAINST GROUND TRUTH")
+    print(f"{'='*60}\n")
+
+    # Get all variables that exist in both graphs
+    all_vars = set(discovered_graph.keys()) & set(true_graph.keys())
+
+    # Count true positives, false positives, false negatives
+    true_positives = 0
+    false_positives = 0
+    false_negatives = 0
+
+    # Track detailed comparison
+    comparison = {}
+
+    for child in all_vars:
+        discovered_parents = set(discovered_graph.get(child, []))
+        true_parents = set(true_graph.get(child, []))
+
+        # Filter to only include parents that exist in both graphs
+        discovered_parents = discovered_parents & all_vars
+        true_parents = true_parents & all_vars
+
+        tp = len(discovered_parents & true_parents)
+        fp = len(discovered_parents - true_parents)
+        fn = len(true_parents - discovered_parents)
+
+        true_positives += tp
+        false_positives += fp
+        false_negatives += fn
+
+        comparison[child] = {
+            'discovered': list(discovered_parents),
+            'true': list(true_parents),
+            'correct': list(discovered_parents & true_parents),
+            'missed': list(true_parents - discovered_parents),
+            'spurious': list(discovered_parents - true_parents)
+        }
+
+    # Calculate metrics
+    precision = true_positives / (true_positives + false_positives) if (true_positives + false_positives) > 0 else 0
+    recall = true_positives / (true_positives + false_negatives) if (true_positives + false_negatives) > 0 else 0
+    f1_score = 2 * (precision * recall) / (precision + recall) if (precision + recall) > 0 else 0
+
+    # Structural Hamming Distance (total edge errors)
+    shd = false_positives + false_negatives
+
+    # Print detailed comparison
+    print("Detailed Comparison by Variable:")
+    print("-" * 60)
+    for child, details in comparison.items():
+        if details['true'] or details['discovered']:
+            print(f"\n{child}:")
+            print(f"  True parents:       {details['true'] if details['true'] else '(none)'}")
+            print(f"  Discovered parents: {details['discovered'] if details['discovered'] else '(none)'}")
+            if details['correct']:
+                print(f"  ✓ Correct:          {details['correct']}")
+            if details['missed']:
+                print(f"  ✗ Missed:           {details['missed']}")
+            if details['spurious']:
+                print(f"  ✗ Spurious:         {details['spurious']}")
+
+    print(f"\n{'='*60}")
+    print("VALIDATION METRICS")
+    print(f"{'='*60}")
+    print(f"Precision: {precision:.3f} ({true_positives}/{true_positives + false_positives} edges correct)")
+    print(f"Recall:    {recall:.3f} ({true_positives}/{true_positives + false_negatives} edges found)")
+    print(f"F1 Score:  {f1_score:.3f}")
+    print(f"SHD:       {shd} (edge errors: {false_positives} spurious + {false_negatives} missed)")
+    print(f"{'='*60}\n")
+
+    return {
+        'precision': precision,
+        'recall': recall,
+        'f1_score': f1_score,
+        'shd': shd,
+        'true_positives': true_positives,
+        'false_positives': false_positives,
+        'false_negatives': false_negatives
+    }
+
 # --- 4. Strategy Implementations ---
 
 def strategy_1_proxy(proxy_data):
@@ -301,7 +450,7 @@ def strategy_3_clustering(sp500_data, proxy_data):
 
 # --- 5. Causal Discovery ---
 
-def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15):
+def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15, test_type='fisherz'):
     """
     Performs causal discovery using the PC algorithm.
 
@@ -309,6 +458,9 @@ def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15):
         data_matrix: DataFrame with features (timesteps x variables)
         alpha: Significance level for conditional independence tests
         max_vars: Maximum number of variables to analyze (for computational efficiency)
+        test_type: Type of conditional independence test ('fisherz' or 'kci')
+                  - fisherz: Fast, assumes Gaussian data (parametric)
+                  - kci: Slower, handles non-Gaussian data (non-parametric)
 
     Returns:
         Tuple of (causal_graph, parent_dict)
@@ -322,16 +474,26 @@ def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15):
         print(f"\nNote: Limiting analysis to first {max_vars} variables for efficiency")
         data_matrix = data_matrix.iloc[:, :max_vars]
 
+    # Select independence test
+    if test_type == 'kci':
+        indep_test = kci
+        test_name = "Kernel CI (non-parametric)"
+        print("\n⚠️  Using KCI test - this may take significantly longer than Fisher-Z")
+    else:
+        indep_test = fisherz
+        test_name = "Fisher-Z (parametric)"
+
     print(f"\nRunning PC Algorithm on {data_matrix.shape[1]} variables...")
     print(f"Sample size: {data_matrix.shape[0]} timesteps")
     print(f"Significance level (alpha): {alpha}")
+    print(f"Independence test: {test_name}")
 
     # Convert to numpy array
     data_array = data_matrix.values
 
-    # Run PC algorithm with Fisher Z test
+    # Run PC algorithm
     try:
-        cg = pc(data_array, alpha=alpha, indep_test=fisherz, stable=True,
+        cg = pc(data_array, alpha=alpha, indep_test=indep_test, stable=True,
                 uc_rule=0, uc_priority=2, mvpc=False, correction_name='MV_Crtn_Fisher_Z',
                 background_knowledge=None, verbose=False, show_progress=False)
 
@@ -382,7 +544,8 @@ def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15):
 
 # --- 6. Main Execution ---
 
-def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
+def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
+         use_lags=False, max_lag=1, test_type='fisherz', validate=True):
     """
     Main function to run strategies and causal discovery.
 
@@ -390,6 +553,10 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
         use_synthetic: If True, use synthetic data instead of real market data
         strategy_num: Which strategy to run (1, 2, or 3)
         perform_causal_analysis: If True, perform causal discovery on the results
+        use_lags: If True, create lagged features for time-series causality
+        max_lag: Maximum number of lags to include (default: 1)
+        test_type: Type of CI test ('fisherz' or 'kci')
+        validate: If True and using synthetic data, validate against ground truth
     """
     print(f"\n{'='*70}")
     print(f"MARKET DATA CAUSAL DISCOVERY ANALYSIS")
@@ -414,7 +581,9 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
             print(f"Failed to download data: {e}")
             print("\nFalling back to synthetic data...")
             return main(use_synthetic=True, strategy_num=strategy_num,
-                       perform_causal_analysis=perform_causal_analysis)
+                       perform_causal_analysis=perform_causal_analysis,
+                       use_lags=use_lags, max_lag=max_lag,
+                       test_type=test_type, validate=validate)
 
         # 3. Filter raw data for different strategies
         # Get tickers that were *successfully* downloaded (some may fail)
@@ -424,7 +593,9 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
         if len(downloaded_proxies) == 0:
             print("\nNo data successfully downloaded. Using synthetic data instead...")
             return main(use_synthetic=True, strategy_num=strategy_num,
-                       perform_causal_analysis=perform_causal_analysis)
+                       perform_causal_analysis=perform_causal_analysis,
+                       use_lags=use_lags, max_lag=max_lag,
+                       test_type=test_type, validate=validate)
 
         print(f"\nSuccessfully downloaded data for {len(downloaded_sp500)} S&P 500 tickers.")
         print(f"Successfully downloaded data for {len(downloaded_proxies)} proxy tickers.")
@@ -455,12 +626,38 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
     print(result_matrix.head())
     print("\n" + "-" * 70 + "\n")
 
+    # --- Apply Lagged Features if Requested ---
+    analysis_matrix = result_matrix
+    if use_lags and perform_causal_analysis:
+        analysis_matrix = create_lagged_features(result_matrix, max_lag=max_lag)
+
     # --- Perform Causal Discovery ---
     if perform_causal_analysis:
-        causal_graph, parent_dict = perform_causal_discovery(result_matrix, alpha=0.05)
+        # Adjust max_vars based on whether we're using lags
+        max_vars_limit = 10 if use_lags else 15
+        if test_type == 'kci':
+            max_vars_limit = min(max_vars_limit, 8)  # KCI is very slow
+
+        causal_graph, parent_dict = perform_causal_discovery(
+            analysis_matrix,
+            alpha=0.05,
+            max_vars=max_vars_limit,
+            test_type=test_type
+        )
 
         if causal_graph is not None:
             print("\n✓ Causal discovery completed successfully!")
+
+            # --- Validate Against Ground Truth (Synthetic Data Only) ---
+            if use_synthetic and validate and not use_lags:
+                # Only validate contemporaneous relationships (no lags)
+                # Filter parent_dict to only include variables in ground truth
+                filtered_parent_dict = {
+                    k: v for k, v in parent_dict.items()
+                    if k in KNOWN_CAUSAL_GRAPH
+                }
+                metrics = validate_causal_graph(filtered_parent_dict, KNOWN_CAUSAL_GRAPH)
+
             return result_matrix, parent_dict
         else:
             print("\n✗ Causal discovery failed.")
@@ -470,16 +667,49 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='Market Data Causal Discovery Analysis')
+    parser = argparse.ArgumentParser(
+        description='Market Data Causal Discovery Analysis',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  # Basic usage with synthetic data
+  python causal.py --synthetic
+
+  # Use lagged features for time-series causality
+  python causal.py --synthetic --use-lags --max-lag 2
+
+  # Use non-parametric KCI test (slower but handles non-Gaussian data)
+  python causal.py --synthetic --test-type kci
+
+  # Combine features: lags + KCI test
+  python causal.py --synthetic --use-lags --test-type kci --max-vars 8
+
+  # Skip validation
+  python causal.py --synthetic --no-validate
+        """
+    )
+
     parser.add_argument('--synthetic', action='store_true',
                        help='Use synthetic data instead of real market data')
     parser.add_argument('--strategy', type=int, default=1, choices=[1, 2, 3],
                        help='Strategy to use: 1=Proxy, 2=PCA, 3=Clustering (default: 1)')
     parser.add_argument('--no-causal', action='store_true',
                        help='Skip causal discovery analysis')
+    parser.add_argument('--use-lags', action='store_true',
+                       help='Create lagged features for time-series causal discovery')
+    parser.add_argument('--max-lag', type=int, default=1,
+                       help='Maximum number of lags to include (default: 1)')
+    parser.add_argument('--test-type', type=str, default='fisherz', choices=['fisherz', 'kci'],
+                       help='Conditional independence test: fisherz (fast, Gaussian) or kci (slow, non-parametric)')
+    parser.add_argument('--no-validate', action='store_true',
+                       help='Skip validation against ground truth (synthetic data only)')
 
     args = parser.parse_args()
 
     main(use_synthetic=args.synthetic,
          strategy_num=args.strategy,
-         perform_causal_analysis=not args.no_causal)
+         perform_causal_analysis=not args.no_causal,
+         use_lags=args.use_lags,
+         max_lag=args.max_lag,
+         test_type=args.test_type,
+         validate=not args.no_validate)
