@@ -7,9 +7,18 @@ from scipy.spatial.distance import cdist
 from causallearn.search.ConstraintBased.PC import pc
 from causallearn.utils.cit import fisherz, kci
 from causallearn.utils.GraphUtils import GraphUtils
+try:
+    from tigramite import data_processing as pp
+    from tigramite.pcmci import PCMCI
+    from tigramite.independence_tests.parcorr import ParCorr
+    from tigramite.independence_tests.robust_parcorr import RobustParCorr
+    TIGRAMITE_AVAILABLE = True
+except ImportError:
+    TIGRAMITE_AVAILABLE = False
+    print("Warning: tigramite not available. PCMCI+ and LPCMCI+ methods will not be available.")
 import warnings
 import argparse
-from typing import Dict, List, Tuple
+from typing import Dict, List, Tuple, Optional
 
 # Suppress warnings from yfinance and sklearn
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -542,10 +551,179 @@ def perform_causal_discovery(data_matrix, alpha=0.05, max_vars=15, test_type='fi
         print("This can happen with insufficient data or numerical issues.")
         return None, {}
 
+def perform_pcmci_analysis(data_matrix: pd.DataFrame, max_lag: int = 5,
+                           alpha: float = 0.05, method: str = 'pcmciplus',
+                           use_robust: bool = False) -> Tuple[Optional[object], Dict[str, List[str]]]:
+    """
+    Performs time-series causal discovery using PCMCI+ or LPCMCI+.
+
+    These methods are specifically designed for time-series data and are
+    superior to manually creating lagged features + PC algorithm.
+
+    Args:
+        data_matrix: DataFrame with features (timesteps × variables)
+        max_lag: Maximum time lag to consider (default: 5 days)
+        alpha: Significance level for conditional independence tests
+        method: 'pcmciplus' or 'lpcmciplus'
+                - pcmciplus: Finds one optimal set of parents from all lags (faster, robust)
+                - lpcmciplus: Finds best parents at each specific lag (slower, more detailed)
+        use_robust: If True, use RobustParCorr (better for non-Gaussian data)
+
+    Returns:
+        Tuple of (PCMCI object, parent_dict)
+    """
+    if not TIGRAMITE_AVAILABLE:
+        print("\n✗ Error: tigramite library not installed.")
+        print("Install with: pip install tigramite")
+        return None, {}
+
+    print(f"\n{'='*60}")
+    print(f"TIME-SERIES CAUSAL DISCOVERY: {method.upper()}")
+    print(f"{'='*60}")
+
+    print(f"\nRunning {method.upper()} on {data_matrix.shape[1]} variables...")
+    print(f"Sample size: {data_matrix.shape[0]} timesteps")
+    print(f"Maximum lag: {max_lag}")
+    print(f"Significance level (alpha): {alpha}")
+
+    # Select independence test
+    if use_robust:
+        indep_test = RobustParCorr(significance='analytic')
+        test_name = "Robust ParCorr (non-Gaussian robust)"
+    else:
+        indep_test = ParCorr(significance='analytic')
+        test_name = "ParCorr (Gaussian)"
+
+    print(f"Independence test: {test_name}")
+
+    if method == 'lpcmciplus':
+        print("\n⚠️  LPCMCI+ is significantly slower than PCMCI+")
+        print("    It tests each lag separately to find lag-specific effects")
+
+    # Convert DataFrame to numpy array and create variable names
+    data_array = data_matrix.values
+    var_names = data_matrix.columns.tolist()
+
+    # Create tigramite dataframe
+    dataframe = pp.DataFrame(
+        data_array,
+        datatime=np.arange(len(data_array)),
+        var_names=var_names
+    )
+
+    try:
+        # Initialize PCMCI
+        pcmci = PCMCI(
+            dataframe=dataframe,
+            cond_ind_test=indep_test,
+            verbosity=0
+        )
+
+        # Run the selected method
+        if method == 'lpcmciplus':
+            # Note: LPCMCI+ may not be available in all tigramite versions
+            # Check if the method exists
+            if hasattr(pcmci, 'run_lpcmciplus'):
+                results = pcmci.run_lpcmciplus(
+                    link_assumptions=None,
+                    tau_min=0,
+                    tau_max=max_lag,
+                    pc_alpha=alpha
+                )
+            else:
+                print("\n⚠️  LPCMCI+ not available in this tigramite version")
+                print("    Falling back to PCMCI+ (which is still excellent for time-series)")
+                print("    For LPCMCI+, upgrade to tigramite>=5.3.0")
+                results = pcmci.run_pcmciplus(
+                    link_assumptions=None,
+                    tau_min=0,
+                    tau_max=max_lag,
+                    pc_alpha=alpha
+                )
+        else:  # pcmciplus
+            results = pcmci.run_pcmciplus(
+                link_assumptions=None,
+                tau_min=0,
+                tau_max=max_lag,
+                pc_alpha=alpha
+            )
+
+        # Extract results
+        graph = results['graph']
+        val_matrix = results['val_matrix']
+        p_matrix = results['p_matrix']
+
+        print(f"\n{'='*60}")
+        print("CAUSAL RELATIONSHIPS DISCOVERED")
+        print(f"{'='*60}\n")
+
+        # Build parent dictionary
+        # graph shape: (N_vars, N_vars, tau_max+1)
+        # graph[i, j, tau] indicates edge type from j at lag tau to i at lag 0
+        parent_dict = {}
+
+        for i, child_var in enumerate(var_names):
+            parents = []
+
+            # Check all possible parent variables
+            for j, parent_var in enumerate(var_names):
+                # Check all lags from 0 to max_lag
+                for tau in range(max_lag + 1):
+                    # graph values: '' = no link, 'o-o' = undirected, '-->' = directed, '<--' = reverse directed, 'x-x' = conflict
+                    edge_type = graph[i, j, tau]
+
+                    if edge_type == '-->' or edge_type == '-->':  # Directed edge from j to i
+                        if tau == 0:
+                            parents.append(f"{parent_var}")
+                        else:
+                            parents.append(f"{parent_var}_L{tau}")
+
+            parent_dict[child_var] = parents
+
+        # Print discovered relationships
+        for var, parents in parent_dict.items():
+            if parents:
+                parents_str = ', '.join(parents)
+                print(f"📊 {var} has causal parents: {parents_str}")
+            else:
+                print(f"📊 {var} has no causal parents (root node or isolated)")
+
+        # Print summary statistics
+        total_edges = sum(len(parents) for parents in parent_dict.values())
+        print(f"\n{'='*60}")
+        print(f"Summary: Discovered {total_edges} causal relationships")
+        print(f"{'='*60}\n")
+
+        # Print lag-specific insights
+        lag_counts = {}
+        for parents in parent_dict.values():
+            for parent in parents:
+                if '_L' in parent:
+                    lag = int(parent.split('_L')[1])
+                    lag_counts[lag] = lag_counts.get(lag, 0) + 1
+                else:
+                    lag_counts[0] = lag_counts.get(0, 0) + 1
+
+        if lag_counts:
+            print("Lag Distribution of Discovered Links:")
+            for lag in sorted(lag_counts.keys()):
+                print(f"  Lag {lag}: {lag_counts[lag]} links")
+            print()
+
+        return pcmci, parent_dict
+
+    except Exception as e:
+        print(f"\nError during {method.upper()} analysis: {e}")
+        print("This can happen with insufficient data or numerical issues.")
+        import traceback
+        traceback.print_exc()
+        return None, {}
+
 # --- 6. Main Execution ---
 
 def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
-         use_lags=False, max_lag=1, test_type='fisherz', validate=True):
+         use_lags=False, max_lag=1, test_type='fisherz', validate=True,
+         method='pc', use_robust=False):
     """
     Main function to run strategies and causal discovery.
 
@@ -553,10 +731,12 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
         use_synthetic: If True, use synthetic data instead of real market data
         strategy_num: Which strategy to run (1, 2, or 3)
         perform_causal_analysis: If True, perform causal discovery on the results
-        use_lags: If True, create lagged features for time-series causality
-        max_lag: Maximum number of lags to include (default: 1)
-        test_type: Type of CI test ('fisherz' or 'kci')
+        use_lags: If True, create lagged features for time-series causality (only for PC)
+        max_lag: Maximum number of lags to include (default: 1 for PC, 5 for PCMCI/LPCMCI)
+        test_type: Type of CI test ('fisherz' or 'kci') - only for PC method
         validate: If True and using synthetic data, validate against ground truth
+        method: Causal discovery method ('pc', 'pcmciplus', 'lpcmciplus')
+        use_robust: If True, use robust tests for non-Gaussian data (RobustParCorr for PCMCI)
     """
     print(f"\n{'='*70}")
     print(f"MARKET DATA CAUSAL DISCOVERY ANALYSIS")
@@ -583,7 +763,8 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
             return main(use_synthetic=True, strategy_num=strategy_num,
                        perform_causal_analysis=perform_causal_analysis,
                        use_lags=use_lags, max_lag=max_lag,
-                       test_type=test_type, validate=validate)
+                       test_type=test_type, validate=validate,
+                       method=method, use_robust=use_robust)
 
         # 3. Filter raw data for different strategies
         # Get tickers that were *successfully* downloaded (some may fail)
@@ -595,7 +776,8 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
             return main(use_synthetic=True, strategy_num=strategy_num,
                        perform_causal_analysis=perform_causal_analysis,
                        use_lags=use_lags, max_lag=max_lag,
-                       test_type=test_type, validate=validate)
+                       test_type=test_type, validate=validate,
+                       method=method, use_robust=use_robust)
 
         print(f"\nSuccessfully downloaded data for {len(downloaded_sp500)} S&P 500 tickers.")
         print(f"Successfully downloaded data for {len(downloaded_proxies)} proxy tickers.")
@@ -626,31 +808,47 @@ def main(use_synthetic=False, strategy_num=1, perform_causal_analysis=True,
     print(result_matrix.head())
     print("\n" + "-" * 70 + "\n")
 
-    # --- Apply Lagged Features if Requested ---
-    analysis_matrix = result_matrix
-    if use_lags and perform_causal_analysis:
-        analysis_matrix = create_lagged_features(result_matrix, max_lag=max_lag)
-
     # --- Perform Causal Discovery ---
     if perform_causal_analysis:
-        # Adjust max_vars based on whether we're using lags
-        max_vars_limit = 10 if use_lags else 15
-        if test_type == 'kci':
-            max_vars_limit = min(max_vars_limit, 8)  # KCI is very slow
+        # Select causal discovery method
+        if method in ['pcmciplus', 'lpcmciplus']:
+            # Use PCMCI+ or LPCMCI+ (time-series specific methods)
+            # These methods handle lags internally, so we don't need create_lagged_features
+            pcmci_max_lag = max_lag if max_lag > 1 else 5  # Default to 5 for PCMCI if not specified
 
-        causal_graph, parent_dict = perform_causal_discovery(
-            analysis_matrix,
-            alpha=0.05,
-            max_vars=max_vars_limit,
-            test_type=test_type
-        )
+            causal_graph, parent_dict = perform_pcmci_analysis(
+                result_matrix,
+                max_lag=pcmci_max_lag,
+                alpha=0.05,
+                method=method,
+                use_robust=use_robust
+            )
+        else:
+            # Use PC algorithm (standard constraint-based method)
+            analysis_matrix = result_matrix
+
+            # Apply lagged features if requested (for PC only)
+            if use_lags:
+                analysis_matrix = create_lagged_features(result_matrix, max_lag=max_lag)
+
+            # Adjust max_vars based on whether we're using lags
+            max_vars_limit = 10 if use_lags else 15
+            if test_type == 'kci':
+                max_vars_limit = min(max_vars_limit, 8)  # KCI is very slow
+
+            causal_graph, parent_dict = perform_causal_discovery(
+                analysis_matrix,
+                alpha=0.05,
+                max_vars=max_vars_limit,
+                test_type=test_type
+            )
 
         if causal_graph is not None:
             print("\n✓ Causal discovery completed successfully!")
 
             # --- Validate Against Ground Truth (Synthetic Data Only) ---
-            if use_synthetic and validate and not use_lags:
-                # Only validate contemporaneous relationships (no lags)
+            if use_synthetic and validate and method == 'pc' and not use_lags:
+                # Only validate contemporaneous relationships (no lags) for PC method
                 # Filter parent_dict to only include variables in ground truth
                 filtered_parent_dict = {
                     k: v for k, v in parent_dict.items()
@@ -672,17 +870,26 @@ if __name__ == "__main__":
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  # Basic usage with synthetic data
+  # Basic usage with PC algorithm
   python causal.py --synthetic
 
-  # Use lagged features for time-series causality
-  python causal.py --synthetic --use-lags --max-lag 2
+  # RECOMMENDED: Use PCMCI+ for time-series causal discovery (faster, robust)
+  python causal.py --synthetic --method pcmciplus
 
-  # Use non-parametric KCI test (slower but handles non-Gaussian data)
-  python causal.py --synthetic --test-type kci
+  # Use PCMCI+ with longer lags (detect effects up to 10 days)
+  python causal.py --synthetic --method pcmciplus --max-lag 10
 
-  # Combine features: lags + KCI test
-  python causal.py --synthetic --use-lags --test-type kci --max-vars 8
+  # Use LPCMCI+ for lag-specific effects (slower, more detailed)
+  python causal.py --synthetic --method lpcmciplus --max-lag 5
+
+  # Use robust tests for non-Gaussian data (with PCMCI methods)
+  python causal.py --synthetic --method pcmciplus --robust
+
+  # PC algorithm with manual lagged features (old approach)
+  python causal.py --synthetic --method pc --use-lags --max-lag 2
+
+  # PC with non-parametric KCI test (slower but handles non-Gaussian data)
+  python causal.py --synthetic --method pc --test-type kci
 
   # Skip validation
   python causal.py --synthetic --no-validate
@@ -693,18 +900,28 @@ Examples:
                        help='Use synthetic data instead of real market data')
     parser.add_argument('--strategy', type=int, default=1, choices=[1, 2, 3],
                        help='Strategy to use: 1=Proxy, 2=PCA, 3=Clustering (default: 1)')
+    parser.add_argument('--method', type=str, default='pc',
+                       choices=['pc', 'pcmciplus', 'lpcmciplus'],
+                       help='Causal discovery method: pc (standard), pcmciplus (time-series, recommended), '
+                            'lpcmciplus (lag-specific, slow) (default: pc)')
     parser.add_argument('--no-causal', action='store_true',
                        help='Skip causal discovery analysis')
     parser.add_argument('--use-lags', action='store_true',
-                       help='Create lagged features for time-series causal discovery')
-    parser.add_argument('--max-lag', type=int, default=1,
-                       help='Maximum number of lags to include (default: 1)')
+                       help='Create lagged features (PC method only, not needed for PCMCI)')
+    parser.add_argument('--max-lag', type=int, default=None,
+                       help='Maximum lag: 1-2 for PC with --use-lags, 5-10 for PCMCI methods')
     parser.add_argument('--test-type', type=str, default='fisherz', choices=['fisherz', 'kci'],
-                       help='Conditional independence test: fisherz (fast, Gaussian) or kci (slow, non-parametric)')
+                       help='CI test for PC method: fisherz (fast, Gaussian) or kci (slow, non-parametric)')
+    parser.add_argument('--robust', action='store_true',
+                       help='Use robust tests for non-Gaussian data (PCMCI methods: RobustParCorr)')
     parser.add_argument('--no-validate', action='store_true',
                        help='Skip validation against ground truth (synthetic data only)')
 
     args = parser.parse_args()
+
+    # Set default max_lag based on method if not specified
+    if args.max_lag is None:
+        args.max_lag = 1 if args.method == 'pc' else 5
 
     main(use_synthetic=args.synthetic,
          strategy_num=args.strategy,
@@ -712,4 +929,6 @@ Examples:
          use_lags=args.use_lags,
          max_lag=args.max_lag,
          test_type=args.test_type,
-         validate=not args.no_validate)
+         validate=not args.no_validate,
+         method=args.method,
+         use_robust=args.robust)
